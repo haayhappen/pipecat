@@ -8,6 +8,13 @@
 
 This module provides an audio resampler that uses the SoX ResampleStream library
 for very high quality audio sample rate conversion.
+
+When to use the SOXRStreamAudioResampler:
+1. For real-time processing scenarios
+2. When dealing with very long audio signals
+3. When processing audio in chunks or streams
+4. When you need to reuse the same resampler configuration multiple times, as it saves initialization overhead
+
 """
 
 import time
