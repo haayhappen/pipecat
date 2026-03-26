@@ -6,7 +6,6 @@
 
 """Deepgram speech-to-text service implementation."""
 
-import asyncio
 from dataclasses import dataclass, field, fields
 from typing import Any, AsyncGenerator, Optional
 
@@ -38,12 +37,14 @@ from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 
 try:
-    from deepgram import AsyncDeepgramClient
-    from deepgram.core.events import EventType
-    from deepgram.listen.v1.types import (
-        ListenV1Results,
-        ListenV1SpeechStarted,
-        ListenV1UtteranceEnd,
+    from deepgram import (
+        AsyncListenWebSocketClient,
+        DeepgramClient,
+        DeepgramClientOptions,
+        ErrorResponse,
+        LiveOptions as _SDKLiveOptions,
+        LiveResultResponse,
+        LiveTranscriptionEvents,
     )
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
@@ -54,8 +55,8 @@ except ModuleNotFoundError as e:
 class LiveOptions:
     """Deepgram live transcription options.
 
-    Compatibility wrapper that mirrors the ``LiveOptions`` class removed in
-    deepgram-sdk v6.
+    Compatibility wrapper that provides a consistent API regardless of the
+    underlying deepgram-sdk version.
 
     .. deprecated:: 0.0.105
         Use ``settings=DeepgramSTTService.Settings(...)`` for runtime-updatable fields
@@ -479,28 +480,19 @@ class DeepgramSTTService(STTService):
                     stacklevel=2,
                 )
 
-        # Build client - support optional custom base URL via DeepgramClientEnvironment
+        # Build client using deepgram-sdk v4 DeepgramClient with keepalive
         if base_url:
-            try:
-                from deepgram import DeepgramClientEnvironment
-
-                ws_url, http_url = _derive_deepgram_urls(base_url)
-                environment = DeepgramClientEnvironment(
-                    base=http_url,
-                    production=ws_url,
-                    agent=ws_url,
-                )
-                self._client = AsyncDeepgramClient(api_key=api_key, environment=environment)
-            except Exception:
-                logger.warning(
-                    f"{self}: Custom base_url configuration failed, falling back to default"
-                )
-                self._client = AsyncDeepgramClient(api_key=api_key)
+            self._client = DeepgramClient(
+                api_key,
+                config=DeepgramClientOptions(url=base_url, options={"keepalive": "true"}),
+            )
         else:
-            self._client = AsyncDeepgramClient(api_key=api_key)
+            self._client = DeepgramClient(
+                api_key,
+                config=DeepgramClientOptions(options={"keepalive": "true"}),
+            )
 
-        self._connection = None
-        self._connection_task = None
+        self._connection: AsyncListenWebSocketClient | None = None
 
         if self.vad_enabled:
             self._register_event_handler("on_speech_started")
@@ -577,15 +569,11 @@ class DeepgramSTTService(STTService):
             Frame: None (transcription results come via WebSocket callbacks).
         """
         if self._connection:
-            try:
-                await self._connection.send_media(audio)
-            except Exception as e:
-                logger.warning(f"{self}: send_media failed, connection will reconnect: {e}")
-                self._connection = None
+            await self._connection.send(audio)
         yield None
 
     def _build_connect_kwargs(self) -> dict:
-        """Build keyword arguments for ``client.listen.v1.connect()`` from current settings."""
+        """Build options dict for ``connection.start(options=...)`` from current settings."""
         kwargs = {}
         s = self._settings
 
@@ -645,89 +633,62 @@ class DeepgramSTTService(STTService):
 
     async def _connect(self):
         logger.debug("Connecting to Deepgram")
-        self._connection_task = self.create_task(self._connection_handler())
+
+        self._connection = self._client.listen.asyncwebsocket.v("1")
+
+        self._connection.on(
+            LiveTranscriptionEvents(LiveTranscriptionEvents.Transcript), self._on_message
+        )
+        self._connection.on(
+            LiveTranscriptionEvents(LiveTranscriptionEvents.Error), self._on_error
+        )
+
+        if self.vad_enabled:
+            self._connection.on(
+                LiveTranscriptionEvents(LiveTranscriptionEvents.SpeechStarted),
+                self._on_speech_started,
+            )
+            self._connection.on(
+                LiveTranscriptionEvents(LiveTranscriptionEvents.UtteranceEnd),
+                self._on_utterance_end,
+            )
+
+        options = self._build_connect_kwargs()
+        if not await self._connection.start(options=options, addons=self._addons):
+            await self.push_error(error_msg="Unable to connect to Deepgram")
+        else:
+            headers = {
+                k: v
+                for k, v in self._connection._socket.response.headers.items()
+                if k.startswith("dg-")
+            }
+            logger.debug(f'{self}: Websocket connection initialized: {{"headers": {headers}}}')
 
     async def _disconnect(self):
-        if not self._connection_task:
-            return
-
-        logger.debug("Disconnecting from Deepgram")
-        # Clear self._connection first to prevent run_stt from sending audio
-        # during the close handshake, then close gracefully on the saved ref.
-        connection = self._connection
-        self._connection = None
-
-        if connection:
-            await connection.send_close_stream()
-
-        await self.cancel_task(self._connection_task)
-        self._connection_task = None
-
-    async def _connection_handler(self):
-        """Manages the full WebSocket lifecycle inside a single async with block.
-
-        Reconnects automatically after transient errors. Exits cleanly when
-        the task is cancelled (i.e. on stop/cancel).
-        """
-        while True:
-            connect_kwargs = self._build_connect_kwargs()
-            try:
-                async with self._client.listen.v1.connect(**connect_kwargs) as connection:
-                    self._connection = connection
-                    connection.on(EventType.MESSAGE, self._on_message)
-                    connection.on(EventType.ERROR, self._on_error)
-
-                    logger.debug(f"{self}: Websocket connection initialized")
-
-                    keepalive_task = self.create_task(
-                        self._keepalive_handler(), f"{self}::keepalive"
-                    )
-                    try:
-                        await connection.start_listening()
-                    finally:
-                        await self.cancel_task(keepalive_task)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.warning(f"{self}: Connection lost, will retry: {e}")
-            finally:
-                self._connection = None
-
-    async def _keepalive_handler(self):
-        """Periodically send KeepAlive frames to prevent server-side timeout.
-
-        Deepgram closes inactive connections after 10 seconds (NET-0001 error).
-        Sending every 5 seconds stays within the recommended 3-5 second interval.
-        """
-        while True:
-            await asyncio.sleep(5)
-            if self._connection:
-                try:
-                    await self._connection.send_keep_alive()
-                    logger.trace(f"{self}: Sent keepalive")
-                except Exception as e:
-                    logger.warning(f"{self}: Keepalive failed: {e}")
+        if self._connection and await self._connection.is_connected():
+            logger.debug("Disconnecting from Deepgram")
+            await self._connection.finish()
 
     async def _start_metrics(self):
         """Start processing metrics collection for this utterance."""
         await self.start_processing_metrics()
 
-    async def _on_error(self, error):
+    async def _on_error(self, *args, **kwargs):
+        error: ErrorResponse = kwargs["error"]
         logger.warning(f"{self} connection error, will retry: {error}")
         await self.push_error(error_msg=f"{error}")
         await self.stop_all_metrics()
-        # Reconnection is handled automatically by the retry loop in
-        # _connection_handler once start_listening() exits after the error.
+        await self._connect()
 
-    async def _on_speech_started(self, message):
+    async def _on_speech_started(self, *args, **kwargs):
         await self._start_metrics()
-        await self._call_event_handler("on_speech_started", message)
+        await self._call_event_handler("on_speech_started", *args, **kwargs)
         await self.broadcast_frame(UserStartedSpeakingFrame)
         if self._should_interrupt:
             await self.broadcast_interruption()
 
-    async def _on_utterance_end(self, message):
-        await self._call_event_handler("on_utterance_end", message)
+    async def _on_utterance_end(self, *args, **kwargs):
+        await self._call_event_handler("on_utterance_end", *args, **kwargs)
         await self.broadcast_frame(UserStoppedSpeakingFrame)
 
     @traced_stt
@@ -737,51 +698,42 @@ class DeepgramSTTService(STTService):
         """Handle a transcription result with tracing."""
         pass
 
-    async def _on_message(self, message):
-        if isinstance(message, ListenV1SpeechStarted):
-            if self.vad_enabled:
-                await self._on_speech_started(message)
-        elif isinstance(message, ListenV1UtteranceEnd):
-            if self.vad_enabled:
-                await self._on_utterance_end(message)
-        elif isinstance(message, ListenV1Results):
-            if not message.channel or len(message.channel.alternatives) == 0:
-                return
-            is_final = message.is_final
-            transcript = message.channel.alternatives[0].transcript
-            language = None
-            if message.channel.alternatives[0].languages:
-                language = message.channel.alternatives[0].languages[0]
-                language = Language(language)
-            if len(transcript) > 0:
-                if is_final:
-                    # Check if this response is from a finalize() call.
-                    # Only mark as finalized when both we requested it AND Deepgram confirms it.
-                    from_finalize = getattr(message, "from_finalize", False) or False
-                    if from_finalize:
-                        self.confirm_finalize()
-                    await self.push_frame(
-                        TranscriptionFrame(
-                            transcript,
-                            self._user_id,
-                            time_now_iso8601(),
-                            language,
-                            result=message,
-                        )
+    async def _on_message(self, *args, **kwargs):
+        result: LiveResultResponse = kwargs["result"]
+        if len(result.channel.alternatives) == 0:
+            return
+        is_final = result.is_final
+        transcript = result.channel.alternatives[0].transcript
+        language = None
+        if result.channel.alternatives[0].languages:
+            language = result.channel.alternatives[0].languages[0]
+            language = Language(language)
+        if len(transcript) > 0:
+            if is_final:
+                from_finalize = getattr(result, "from_finalize", False)
+                if from_finalize:
+                    self.confirm_finalize()
+                await self.push_frame(
+                    TranscriptionFrame(
+                        transcript,
+                        self._user_id,
+                        time_now_iso8601(),
+                        language,
+                        result=result,
                     )
-                    await self._handle_transcription(transcript, is_final, language)
-                    await self.stop_processing_metrics()
-                else:
-                    # For interim transcriptions, just push the frame without tracing
-                    await self.push_frame(
-                        InterimTranscriptionFrame(
-                            transcript,
-                            self._user_id,
-                            time_now_iso8601(),
-                            language,
-                            result=message,
-                        )
+                )
+                await self._handle_transcription(transcript, is_final, language)
+                await self.stop_processing_metrics()
+            else:
+                await self.push_frame(
+                    InterimTranscriptionFrame(
+                        transcript,
+                        self._user_id,
+                        time_now_iso8601(),
+                        language,
+                        result=result,
                     )
+                )
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames with Deepgram-specific handling.
@@ -800,5 +752,5 @@ class DeepgramSTTService(STTService):
             # Mark that we're awaiting a from_finalize response
             if self._connection:
                 self.request_finalize()
-                await self._connection.send_finalize()
+                await self._connection.finalize()
                 logger.trace(f"Triggered finalize event on: {frame.name=}, {direction=}")
