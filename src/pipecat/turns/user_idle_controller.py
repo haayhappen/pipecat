@@ -138,6 +138,22 @@ class UserIdleController(BaseObject):
         elif isinstance(frame, (FunctionCallResultFrame, FunctionCallCancelFrame)):
             self._function_calls_in_progress = max(0, self._function_calls_in_progress - 1)
 
+    def get_state(self) -> dict:
+        """Return a snapshot of the idle controller's internal state for diagnostics."""
+        timer_running = self._idle_timer_task is not None
+        timer_age_s = None
+        if timer_running and self._diag_timer_started_at:
+            timer_age_s = round(time.monotonic() - self._diag_timer_started_at, 3)
+        return {
+            "timer_running": timer_running,
+            "timer_age_s": timer_age_s,
+            "timer_timeout_s": self._user_idle_timeout,
+            "timer_start_reason": self._diag_timer_start_reason,
+            "timer_last_cancel_reason": self._diag_timer_cancel_reason,
+            "user_turn_in_progress": self._user_turn_in_progress,
+            "function_calls_in_progress": self._function_calls_in_progress,
+        }
+
     async def _start_idle_timer(self):
         """Start (or restart) the idle timer."""
         if self._user_idle_timeout <= 0:

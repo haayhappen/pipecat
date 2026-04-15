@@ -13,7 +13,6 @@ with configurable session timeouts and WAV header generation.
 
 import asyncio
 import io
-import os
 import time
 import typing
 import wave
@@ -21,8 +20,6 @@ from typing import Awaitable, Callable, Optional
 
 from loguru import logger
 from pydantic import BaseModel
-
-_DIAG_INGRESS = os.getenv("DEAF_PIPELINE_DIAGNOSTICS", "false").lower() == "true"
 
 from pipecat.frames.frames import (
     CancelFrame,
@@ -242,7 +239,7 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
 
         self._diag_media_in_count: int = 0
         self._diag_last_media_in_ts: float = 0.0
-        self._diag_empty_deser_count: int = 0
+        self._diag_non_audio_msg_count: int = 0
 
     async def start(self, frame: StartFrame):
         """Start the input transport and begin message processing.
@@ -307,7 +304,7 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
         return {
             "media_in_count": self._diag_media_in_count,
             "last_media_in_age_s": round(time.monotonic() - self._diag_last_media_in_ts, 3) if self._diag_last_media_in_ts else None,
-            "empty_deser_count": self._diag_empty_deser_count,
+            "non_audio_msg_count": self._diag_non_audio_msg_count,
         }
 
     async def _receive_messages(self):
@@ -320,14 +317,12 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
                 frame = await self._params.serializer.deserialize(message)
 
                 if not frame:
-                    if _DIAG_INGRESS:
-                        self._diag_empty_deser_count += 1
+                    self._diag_non_audio_msg_count += 1
                     continue
 
                 if isinstance(frame, InputAudioRawFrame):
-                    if _DIAG_INGRESS:
-                        self._diag_media_in_count += 1
-                        self._diag_last_media_in_ts = time.monotonic()
+                    self._diag_media_in_count += 1
+                    self._diag_last_media_in_ts = time.monotonic()
                     await self.push_audio_frame(frame)
                 elif isinstance(frame, InputTransportMessageFrame):
                     await self.broadcast_frame(InputTransportMessageFrame, message=frame.message)

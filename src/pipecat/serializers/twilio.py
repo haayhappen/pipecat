@@ -8,13 +8,10 @@
 
 import base64
 import json
-import os
 import time
 from typing import Optional
 
 from loguru import logger
-
-_DIAG_TWILIO = os.getenv("DEAF_PIPELINE_DIAGNOSTICS", "false").lower() == "true"
 
 from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.audio.utils import create_stream_resampler, pcm_to_ulaw, ulaw_to_pcm
@@ -270,14 +267,12 @@ class TwilioFrameSerializer(FrameSerializer):
                 payload, self._twilio_sample_rate, self._sample_rate, self._input_resampler
             )
             if deserialized_data is None or len(deserialized_data) == 0:
-                if _DIAG_TWILIO:
-                    self._diag_deser_empty += 1
+                self._diag_deser_empty += 1
                 return None
 
-            if _DIAG_TWILIO:
-                self._diag_deser_count += 1
-                self._diag_deser_bytes += len(deserialized_data)
-                self._diag_last_deser_ts = time.monotonic()
+            self._diag_deser_count += 1
+            self._diag_deser_bytes += len(deserialized_data)
+            self._diag_last_deser_ts = time.monotonic()
 
             audio_frame = InputAudioRawFrame(
                 audio=deserialized_data, num_channels=1, sample_rate=self._sample_rate

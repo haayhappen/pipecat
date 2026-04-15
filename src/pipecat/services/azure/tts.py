@@ -7,6 +7,7 @@
 """Azure Cognitive Services Text-to-Speech service implementations."""
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import AsyncGenerator, Optional
 
@@ -356,6 +357,10 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             None  # Track current context_id for word timestamps
         )
 
+        self._diag_run_tts_started_at: float = 0.0
+        self._diag_run_tts_text: str | None = None
+        self._diag_run_tts_chunks_received: int = 0
+
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
 
@@ -663,6 +668,16 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             except asyncio.QueueEmpty:
                 break
 
+    def get_tts_diag_state(self) -> dict:
+        """Return diagnostic state for the TTS service at snapshot time."""
+        blocking = self._diag_run_tts_started_at > 0
+        return {
+            "blocking": blocking,
+            "blocking_for_s": round(time.monotonic() - self._diag_run_tts_started_at, 3) if blocking else None,
+            "text": self._diag_run_tts_text,
+            "chunks_received": self._diag_run_tts_chunks_received,
+        }
+
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Generate speech from text using Azure's streaming synthesis.
@@ -675,6 +690,10 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             Frame: Audio frames containing synthesized speech data.
         """
         logger.debug(f"{self}: Generating TTS [{text}]")
+
+        self._diag_run_tts_started_at = time.monotonic()
+        self._diag_run_tts_text = text[:80]
+        self._diag_run_tts_chunks_received = 0
 
         # Clear the audio queue in case there's still audio in it, causing the next audio response
         # to be cut off by the 'None' element returned at the end of the previous audio synthesis.
@@ -710,6 +729,7 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
                         yield ErrorFrame(error=str(chunk))
                         break
 
+                    self._diag_run_tts_chunks_received += 1
                     frame = TTSAudioRawFrame(
                         audio=chunk,
                         sample_rate=self.sample_rate,
@@ -728,13 +748,17 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
                 else:
                     self._cumulative_audio_offset += self._current_sentence_duration
 
+                self._diag_run_tts_started_at = 0.0
+
             except Exception as e:
+                self._diag_run_tts_started_at = 0.0
                 yield ErrorFrame(error=f"Unknown error occurred: {e}")
                 yield TTSStoppedFrame(context_id=context_id)
                 self._reset_state()
                 return
 
         except Exception as e:
+            self._diag_run_tts_started_at = 0.0
             yield ErrorFrame(error=f"Unknown error occurred: {e}")
 
 
