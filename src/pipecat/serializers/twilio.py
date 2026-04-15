@@ -8,9 +8,13 @@
 
 import base64
 import json
+import os
+import time
 from typing import Optional
 
 from loguru import logger
+
+_DIAG_TWILIO = os.getenv("DEAF_PIPELINE_DIAGNOSTICS", "false").lower() == "true"
 
 from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.audio.utils import create_stream_resampler, pcm_to_ulaw, ulaw_to_pcm
@@ -115,6 +119,11 @@ class TwilioFrameSerializer(FrameSerializer):
         self._input_resampler = create_stream_resampler()
         self._output_resampler = create_stream_resampler()
         self._hangup_attempted = False
+
+        self._diag_deser_count: int = 0
+        self._diag_deser_bytes: int = 0
+        self._diag_deser_empty: int = 0
+        self._diag_last_deser_ts: float = 0.0
 
     async def setup(self, frame: StartFrame):
         """Sets up the serializer with pipeline configuration.
@@ -231,6 +240,15 @@ class TwilioFrameSerializer(FrameSerializer):
         except Exception as e:
             logger.error(f"Failed to hang up Twilio call: {e}")
 
+    def get_deserialize_stats(self) -> dict:
+        """Return deserialization counters for diagnostics."""
+        return {
+            "deser_count": self._diag_deser_count,
+            "deser_bytes": self._diag_deser_bytes,
+            "deser_empty": self._diag_deser_empty,
+            "last_deser_age_s": round(time.monotonic() - self._diag_last_deser_ts, 3) if self._diag_last_deser_ts else None,
+        }
+
     async def deserialize(self, data: str | bytes) -> Frame | None:
         """Deserializes Twilio WebSocket data to Pipecat frames.
 
@@ -248,13 +266,18 @@ class TwilioFrameSerializer(FrameSerializer):
             payload_base64 = message["media"]["payload"]
             payload = base64.b64decode(payload_base64)
 
-            # Input: Convert Twilio's 8kHz μ-law to PCM at pipeline input rate
             deserialized_data = await ulaw_to_pcm(
                 payload, self._twilio_sample_rate, self._sample_rate, self._input_resampler
             )
             if deserialized_data is None or len(deserialized_data) == 0:
-                # Ignoring in case we don't have audio
+                if _DIAG_TWILIO:
+                    self._diag_deser_empty += 1
                 return None
+
+            if _DIAG_TWILIO:
+                self._diag_deser_count += 1
+                self._diag_deser_bytes += len(deserialized_data)
+                self._diag_last_deser_ts = time.monotonic()
 
             audio_frame = InputAudioRawFrame(
                 audio=deserialized_data, num_channels=1, sample_rate=self._sample_rate
@@ -266,7 +289,6 @@ class TwilioFrameSerializer(FrameSerializer):
             try:
                 return InputDTMFFrame(KeypadEntry(digit))
             except ValueError as e:
-                # Handle case where string doesn't match any enum value
                 return None
         else:
             return None

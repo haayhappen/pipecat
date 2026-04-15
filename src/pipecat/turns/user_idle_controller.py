@@ -7,7 +7,11 @@
 """This module defines a controller for managing user idle detection."""
 
 import asyncio
+import os
+import time
 from typing import Optional
+
+from loguru import logger as _idle_logger
 
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
@@ -70,6 +74,11 @@ class UserIdleController(BaseObject):
         self._function_calls_in_progress: int = 0
         self._idle_timer_task: Optional[asyncio.Task] = None
 
+        self._diag_enabled = os.getenv("DEAF_PIPELINE_DIAGNOSTICS", "false").lower() == "true"
+        self._diag_timer_start_reason: str | None = None
+        self._diag_timer_cancel_reason: str | None = None
+        self._diag_timer_started_at: float = 0.0
+
         self._register_event_handler("on_user_turn_idle", sync=True)
 
     @property
@@ -105,31 +114,26 @@ class UserIdleController(BaseObject):
             return
 
         if isinstance(frame, BotStoppedSpeakingFrame):
-            # Only start the timer if the user isn't mid-turn and no function
-            # calls are pending.
-            #
-            # Interruption case: the frame order is UserStartedSpeaking →
-            # BotStoppedSpeaking → (user keeps talking) → UserStoppedSpeaking.
-            # Without the user-turn guard the timer would start while the user
-            # is still speaking.
-            #
-            # Function call case: normally FunctionCallsStarted arrives after
-            # BotStoppedSpeaking and cancels the timer directly. But a race
-            # condition can cause FunctionCallsStarted to arrive before
-            # BotStoppedSpeaking when pushing a TTSSpeakFrame in the
-            # on_function_calls_started event handler, so the counter guard
-            # prevents the timer from starting while a function call is in progress.
             if not self._user_turn_in_progress and self._function_calls_in_progress == 0:
+                self._diag_timer_start_reason = "bot_stopped_speaking"
                 await self._start_idle_timer()
+            elif self._diag_enabled:
+                _idle_logger.debug(
+                    f"[IDLE-DIAG] BotStoppedSpeaking but timer NOT started "
+                    f"(user_turn={self._user_turn_in_progress}, fc={self._function_calls_in_progress})"
+                )
         elif isinstance(frame, BotStartedSpeakingFrame):
+            self._diag_timer_cancel_reason = "bot_started_speaking"
             await self._cancel_idle_timer()
         elif isinstance(frame, UserStartedSpeakingFrame):
             self._user_turn_in_progress = True
+            self._diag_timer_cancel_reason = "user_started_speaking"
             await self._cancel_idle_timer()
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self._user_turn_in_progress = False
         elif isinstance(frame, FunctionCallsStartedFrame):
             self._function_calls_in_progress += len(frame.function_calls)
+            self._diag_timer_cancel_reason = "function_calls_started"
             await self._cancel_idle_timer()
         elif isinstance(frame, (FunctionCallResultFrame, FunctionCallCancelFrame)):
             self._function_calls_in_progress = max(0, self._function_calls_in_progress - 1)
@@ -139,21 +143,38 @@ class UserIdleController(BaseObject):
         if self._user_idle_timeout <= 0:
             return
         await self._cancel_idle_timer()
+        self._diag_timer_started_at = time.monotonic()
+        if self._diag_enabled:
+            _idle_logger.debug(
+                f"[IDLE-DIAG] Timer started ({self._user_idle_timeout}s) "
+                f"reason={self._diag_timer_start_reason}"
+            )
         self._idle_timer_task = self.task_manager.create_task(
             self._idle_timer_expired(),
             f"{self}::idle_timer",
         )
-        # Make sure the task is scheduled.
         await asyncio.sleep(0)
 
     async def _cancel_idle_timer(self):
         """Cancel the idle timer if running."""
         if self._idle_timer_task:
+            elapsed = round(time.monotonic() - self._diag_timer_started_at, 3) if self._diag_timer_started_at else 0
+            if self._diag_enabled:
+                _idle_logger.debug(
+                    f"[IDLE-DIAG] Timer cancelled after {elapsed}s "
+                    f"reason={self._diag_timer_cancel_reason}"
+                )
             await self.task_manager.cancel_task(self._idle_timer_task)
             self._idle_timer_task = None
 
     async def _idle_timer_expired(self):
         """Sleep for the timeout duration then fire the idle event."""
         await asyncio.sleep(self._user_idle_timeout)
+        elapsed = round(time.monotonic() - self._diag_timer_started_at, 3) if self._diag_timer_started_at else 0
+        if self._diag_enabled:
+            _idle_logger.debug(
+                f"[IDLE-DIAG] Timer expired after {elapsed}s "
+                f"(timeout={self._user_idle_timeout}s, start_reason={self._diag_timer_start_reason})"
+            )
         self._idle_timer_task = None
         await self._call_event_handler("on_user_turn_idle")
