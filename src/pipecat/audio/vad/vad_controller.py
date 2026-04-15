@@ -81,11 +81,26 @@ class VADController(BaseObject):
         # be greater than the audio chunks to have any effect).
         self._speech_activity_period = speech_activity_period
 
+        self._diag_audio_frames_in: int = 0
+        self._diag_last_audio_ts: float = 0.0
+        self._diag_speech_started_count: int = 0
+        self._diag_speech_stopped_count: int = 0
+
         self._register_event_handler("on_speech_started", sync=True)
         self._register_event_handler("on_speech_stopped", sync=True)
         self._register_event_handler("on_speech_activity", sync=True)
         self._register_event_handler("on_push_frame", sync=True)
         self._register_event_handler("on_broadcast_frame", sync=True)
+
+    def get_diag_state(self) -> dict:
+        """Return diagnostic counters for snapshot inclusion."""
+        return {
+            "audio_frames_in": self._diag_audio_frames_in,
+            "last_audio_age_s": round(time.monotonic() - self._diag_last_audio_ts, 3) if self._diag_last_audio_ts else None,
+            "speech_started": self._diag_speech_started_count,
+            "speech_stopped": self._diag_speech_stopped_count,
+            "current_state": self._vad_state.name,
+        }
 
     async def process_frame(self, frame: Frame):
         """Process a frame and handle VAD-related events.
@@ -128,6 +143,9 @@ class VADController(BaseObject):
         Args:
             frame: Audio frame to process.
         """
+        self._diag_audio_frames_in += 1
+        self._diag_last_audio_ts = time.monotonic()
+
         self._vad_state = await self._handle_vad(frame.audio, self._vad_state)
 
         if self._vad_state == VADState.SPEAKING:
@@ -142,8 +160,10 @@ class VADController(BaseObject):
             and new_vad_state != VADState.STOPPING
         ):
             if new_vad_state == VADState.SPEAKING:
+                self._diag_speech_started_count += 1
                 await self._call_event_handler("on_speech_started")
             elif new_vad_state == VADState.QUIET:
+                self._diag_speech_stopped_count += 1
                 await self._call_event_handler("on_speech_stopped")
 
             vad_state = new_vad_state
