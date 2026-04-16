@@ -93,6 +93,16 @@ class BaseInputTransport(FrameProcessor):
         # them downstream until we get another `StartFrame`.
         self._paused = False
 
+        # Audio-queue silence diagnostics (read-only). The existing
+        # AUDIO_INPUT_TIMEOUT_SECS timeout in _audio_task_handler is a 500ms
+        # heartbeat against the input queue. These counters turn it into a
+        # silence signal the pipeline can inspect, independent of VAD/STT.
+        self._diag_audio_queue_timeouts: int = 0
+        self._diag_last_audio_enqueue_ts: float = 0.0
+        self._diag_last_audio_queue_timeout_ts: float = 0.0
+        self._diag_audio_silence_streak_s: float = 0.0
+        self._diag_max_audio_silence_streak_s: float = 0.0
+
         if self._params.vad_enabled:
             import warnings
 
@@ -323,7 +333,38 @@ class BaseInputTransport(FrameProcessor):
             frame: The input audio frame to process.
         """
         if self._params.audio_in_enabled and not self._paused:
+            self._diag_last_audio_enqueue_ts = time.monotonic()
             await self._audio_in_queue.put(frame)
+
+    def get_audio_in_silence_state(self) -> dict:
+        """Return read-only silence state of the audio input queue.
+
+        The ``audio_queue_timeouts`` counter ticks every ``AUDIO_INPUT_TIMEOUT_SECS``
+        seconds when no audio frames reach the queue. This is the tightest
+        silence signal available anywhere in the pipeline because it's driven
+        by the transport thread itself.
+        """
+        now = time.monotonic()
+        current_streak_s = 0.0
+        if self._diag_last_audio_enqueue_ts:
+            current_streak_s = now - self._diag_last_audio_enqueue_ts
+        return {
+            "audio_queue_timeouts": self._diag_audio_queue_timeouts,
+            "last_audio_enqueue_age_s": (
+                round(now - self._diag_last_audio_enqueue_ts, 3)
+                if self._diag_last_audio_enqueue_ts
+                else None
+            ),
+            "last_audio_queue_timeout_age_s": (
+                round(now - self._diag_last_audio_queue_timeout_ts, 3)
+                if self._diag_last_audio_queue_timeout_ts
+                else None
+            ),
+            "current_silence_streak_s": round(current_streak_s, 3),
+            "max_audio_silence_streak_s": round(self._diag_max_audio_silence_streak_s, 3),
+            "audio_in_enabled": self._params.audio_in_enabled,
+            "paused": self._paused,
+        }
 
     #
     # Frame processor
@@ -452,6 +493,18 @@ class BaseInputTransport(FrameProcessor):
 
                 self._audio_in_queue.task_done()
             except asyncio.TimeoutError:
+                # Diagnostic: every AUDIO_INPUT_TIMEOUT_SECS with an empty
+                # queue ticks this counter. Non-invasive; no behaviour change.
+                self._diag_audio_queue_timeouts += 1
+                self._diag_last_audio_queue_timeout_ts = time.monotonic()
+                if self._diag_last_audio_enqueue_ts:
+                    self._diag_audio_silence_streak_s = (
+                        self._diag_last_audio_queue_timeout_ts
+                        - self._diag_last_audio_enqueue_ts
+                    )
+                    if self._diag_audio_silence_streak_s > self._diag_max_audio_silence_streak_s:
+                        self._diag_max_audio_silence_streak_s = self._diag_audio_silence_streak_s
+
                 if not audio_received:
                     continue
 

@@ -13,7 +13,9 @@ with configurable session timeouts and WAV header generation.
 
 import asyncio
 import io
+import os
 import time
+import traceback
 import typing
 import wave
 from typing import Awaitable, Callable, Optional
@@ -49,6 +51,24 @@ except ModuleNotFoundError as e:
         "In order to use FastAPI websockets, you need to `pip install pipecat-ai[websocket]`."
     )
     raise Exception(f"Missing module: {e}")
+
+
+# Threshold above which an individual WebSocket send() call is considered "slow"
+# and a WARN is emitted. The event loop handing a call that long strongly
+# suggests TCP back-pressure or a half-dead remote. Read-only diagnostic, does
+# not change behaviour.
+SLOW_SEND_THRESHOLD_MS: float = 250.0
+
+# Silence watchdog configuration. The watchdog is gated behind the
+# DEAF_PIPELINE_DIAGNOSTICS environment variable and NEVER cancels the receive
+# task or closes the socket. It only logs.
+_DEAF_PIPELINE_DIAGNOSTICS_ENV = "DEAF_PIPELINE_DIAGNOSTICS"
+SILENCE_WATCHDOG_INTERVAL_S: float = 10.0
+SILENCE_WATCHDOG_THRESHOLD_S: float = 10.0
+
+
+def _deaf_diagnostics_enabled() -> bool:
+    return os.getenv(_DEAF_PIPELINE_DIAGNOSTICS_ENV, "false").lower() == "true"
 
 
 class FastAPIWebsocketParams(TransportParams):
@@ -121,6 +141,27 @@ class FastAPIWebsocketClient:
         self._callbacks = callbacks
         self._leave_counter = 0
 
+        # Egress diagnostic counters (read-only telemetry).
+        self._diag_send_attempts: int = 0
+        self._diag_send_success: int = 0
+        self._diag_send_bytes: int = 0
+        self._diag_last_send_ts: float = 0.0
+        self._diag_last_send_success_ts: float = 0.0
+        self._diag_send_exc_count: int = 0
+        self._diag_last_send_exc_ts: float = 0.0
+        self._diag_last_send_exc_type: Optional[str] = None
+        # Send-path wall-clock latency (see SLOW_SEND_THRESHOLD_MS).
+        self._diag_last_send_latency_ms: float = 0.0
+        self._diag_max_send_latency_ms: float = 0.0
+        self._diag_slow_send_count: int = 0
+        # Non-zero while a send() is awaiting; used by the silence watchdog to
+        # detect sends blocked on TCP drain.
+        self._diag_in_flight_send_started_ts: float = 0.0
+        # Number of send() calls that were skipped because _can_send() returned
+        # False. A growing value while the pipeline still pushes frames
+        # indicates the WS layer believes we're disconnected.
+        self._diag_send_skipped_count: int = 0
+
     async def setup(self, _: StartFrame):
         """Set up the WebSocket client.
 
@@ -143,16 +184,101 @@ class FastAPIWebsocketClient:
         Args:
             data: The data to send (string or bytes).
         """
+        if not self._can_send():
+            self._diag_send_skipped_count += 1
+            return
+
+        self._diag_send_attempts += 1
+        self._diag_last_send_ts = time.monotonic()
+        data_len = len(data) if isinstance(data, (bytes, bytearray, str)) else 0
+        t0 = time.monotonic()
+        self._diag_in_flight_send_started_ts = t0
         try:
-            if self._can_send():
-                if isinstance(data, bytes):
-                    await self._websocket.send_bytes(data)
-                else:
-                    await self._websocket.send_text(data)
+            if isinstance(data, bytes):
+                await self._websocket.send_bytes(data)
+            else:
+                await self._websocket.send_text(data)
+            self._diag_send_success += 1
+            self._diag_send_bytes += data_len
+            self._diag_last_send_success_ts = time.monotonic()
         except Exception as e:
+            self._diag_send_exc_count += 1
+            self._diag_last_send_exc_ts = time.monotonic()
+            self._diag_last_send_exc_type = e.__class__.__name__
             logger.warning(
-                f"{self} exception sending data: {e.__class__.__name__} ({e}), application_state: {self._websocket.application_state}"
+                f"{self} exception sending data: {e.__class__.__name__} ({e}), "
+                f"application_state: {self._websocket.application_state}, "
+                f"send_attempts={self._diag_send_attempts}, "
+                f"send_exc_count={self._diag_send_exc_count}"
             )
+        finally:
+            latency_ms = (time.monotonic() - t0) * 1000.0
+            self._diag_last_send_latency_ms = latency_ms
+            if latency_ms > self._diag_max_send_latency_ms:
+                self._diag_max_send_latency_ms = latency_ms
+            if latency_ms > SLOW_SEND_THRESHOLD_MS:
+                self._diag_slow_send_count += 1
+                try:
+                    client_state = self._websocket.client_state.name
+                    application_state = self._websocket.application_state.name
+                except Exception:
+                    client_state = "unknown"
+                    application_state = "unknown"
+                logger.warning(
+                    f"{self} slow websocket send: {latency_ms:.1f} ms "
+                    f"(threshold={SLOW_SEND_THRESHOLD_MS:.0f} ms, "
+                    f"bytes={data_len}, client_state={client_state}, "
+                    f"application_state={application_state}, "
+                    f"slow_send_count={self._diag_slow_send_count})"
+                )
+            self._diag_in_flight_send_started_ts = 0.0
+
+    def get_egress_stats(self) -> dict:
+        """Return outbound-send diagnostic counters.
+
+        The stats distinguish three fatal failure modes of a silently-dead
+        WebSocket: fast-success (TCP buffer absorbing writes), blocked-drain
+        (in_flight_send_age_s climbing), and raised-exception.
+        """
+        now = time.monotonic()
+        in_flight_age = (
+            round(now - self._diag_in_flight_send_started_ts, 3)
+            if self._diag_in_flight_send_started_ts
+            else None
+        )
+        try:
+            client_state = self._websocket.client_state.name
+            application_state = self._websocket.application_state.name
+        except Exception:
+            client_state = "unknown"
+            application_state = "unknown"
+        return {
+            "send_attempts": self._diag_send_attempts,
+            "send_success": self._diag_send_success,
+            "send_bytes": self._diag_send_bytes,
+            "send_exc_count": self._diag_send_exc_count,
+            "send_skipped_count": self._diag_send_skipped_count,
+            "last_send_age_s": round(now - self._diag_last_send_ts, 3) if self._diag_last_send_ts else None,
+            "last_send_success_age_s": (
+                round(now - self._diag_last_send_success_ts, 3)
+                if self._diag_last_send_success_ts
+                else None
+            ),
+            "last_send_exc_age_s": (
+                round(now - self._diag_last_send_exc_ts, 3)
+                if self._diag_last_send_exc_ts
+                else None
+            ),
+            "last_send_exc_type": self._diag_last_send_exc_type,
+            "last_send_latency_ms": round(self._diag_last_send_latency_ms, 2),
+            "max_send_latency_ms": round(self._diag_max_send_latency_ms, 2),
+            "slow_send_count": self._diag_slow_send_count,
+            "in_flight_send_age_s": in_flight_age,
+            "is_connected": self.is_connected,
+            "is_closing": self.is_closing,
+            "client_state": client_state,
+            "application_state": application_state,
+        }
 
     async def disconnect(self):
         """Disconnect the WebSocket client."""
@@ -240,6 +366,19 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
         self._diag_media_in_count: int = 0
         self._diag_last_media_in_ts: float = 0.0
         self._diag_non_audio_msg_count: int = 0
+        # Unconditional: stamped on every WS iteration (any kind of message).
+        # This is the primary signal the silence watchdog uses.
+        self._diag_last_any_recv_ts: float = 0.0
+        # Stamped whenever we receive a non-audio WS message (text, empty, or
+        # non-InputAudioRawFrame after deserialization).
+        self._diag_last_non_audio_ts: float = 0.0
+        self._diag_last_non_audio_kind: Optional[str] = None
+        # Soft silence watchdog (gated on DEAF_PIPELINE_DIAGNOSTICS).
+        self._silence_watchdog_task = None
+        # Receive loop exit logging: set to non-None when finally-block runs,
+        # used by pipeline-level diagnostics to correlate with heartbeats.
+        self._diag_receive_loop_exit_ts: float = 0.0
+        self._diag_receive_loop_exit_reason: Optional[str] = None
 
     async def start(self, frame: StartFrame):
         """Start the input transport and begin message processing.
@@ -263,6 +402,8 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
         await self.push_frame(ClientConnectedFrame())
         if not self._receive_task:
             self._receive_task = self.create_task(self._receive_messages())
+        if not self._silence_watchdog_task and _deaf_diagnostics_enabled():
+            self._silence_watchdog_task = self.create_task(self._silence_watchdog())
         await self.set_transport_ready(frame)
 
     async def _stop_tasks(self):
@@ -270,6 +411,9 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
         if self._monitor_websocket_task:
             await self.cancel_task(self._monitor_websocket_task)
             self._monitor_websocket_task = None
+        if self._silence_watchdog_task:
+            await self.cancel_task(self._silence_watchdog_task)
+            self._silence_watchdog_task = None
         if self._receive_task:
             await self.cancel_task(self._receive_task)
             self._receive_task = None
@@ -301,23 +445,50 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
 
     def get_ingress_stats(self) -> dict:
         """Return media ingress counters for diagnostics."""
+        now = time.monotonic()
         return {
             "media_in_count": self._diag_media_in_count,
-            "last_media_in_age_s": round(time.monotonic() - self._diag_last_media_in_ts, 3) if self._diag_last_media_in_ts else None,
+            "last_media_in_age_s": round(now - self._diag_last_media_in_ts, 3) if self._diag_last_media_in_ts else None,
             "non_audio_msg_count": self._diag_non_audio_msg_count,
+            "last_any_recv_age_s": round(now - self._diag_last_any_recv_ts, 3) if self._diag_last_any_recv_ts else None,
+            "last_non_audio_age_s": round(now - self._diag_last_non_audio_ts, 3) if self._diag_last_non_audio_ts else None,
+            "last_non_audio_kind": self._diag_last_non_audio_kind,
+            "receive_loop_exit_age_s": (
+                round(now - self._diag_receive_loop_exit_ts, 3)
+                if self._diag_receive_loop_exit_ts
+                else None
+            ),
+            "receive_loop_exit_reason": self._diag_receive_loop_exit_reason,
         }
 
     async def _receive_messages(self):
         """Main message receiving loop for WebSocket messages."""
+        exit_reason: str = "clean"
         try:
             async for message in self._client.receive():
+                # Stamp unconditionally BEFORE serializer.deserialize so we see
+                # any WS traffic (including text/control messages) reach the
+                # loop, independent of whether the serializer produces a frame.
+                self._diag_last_any_recv_ts = time.monotonic()
+
                 if not self._params.serializer:
+                    self._diag_non_audio_msg_count += 1
+                    self._diag_last_non_audio_ts = self._diag_last_any_recv_ts
+                    self._diag_last_non_audio_kind = (
+                        "bytes" if isinstance(message, (bytes, bytearray)) else "text"
+                    )
                     continue
 
                 frame = await self._params.serializer.deserialize(message)
 
                 if not frame:
                     self._diag_non_audio_msg_count += 1
+                    self._diag_last_non_audio_ts = time.monotonic()
+                    self._diag_last_non_audio_kind = (
+                        "empty-bytes"
+                        if isinstance(message, (bytes, bytearray))
+                        else "empty-text"
+                    )
                     continue
 
                 if isinstance(frame, InputAudioRawFrame):
@@ -325,11 +496,49 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
                     self._diag_last_media_in_ts = time.monotonic()
                     await self.push_audio_frame(frame)
                 elif isinstance(frame, InputTransportMessageFrame):
+                    self._diag_last_non_audio_ts = time.monotonic()
+                    self._diag_last_non_audio_kind = "transport-message"
                     await self.broadcast_frame(InputTransportMessageFrame, message=frame.message)
                 else:
+                    self._diag_last_non_audio_ts = time.monotonic()
+                    self._diag_last_non_audio_kind = frame.__class__.__name__
                     await self.push_frame(frame)
         except Exception as e:
+            exit_reason = f"exception:{e.__class__.__name__}:{e}"
             logger.error(f"{self} exception receiving data: {e.__class__.__name__} ({e})")
+        finally:
+            # Explicit exit log: distinguishes a clean async-for completion
+            # (Twilio sent websocket.disconnect) from a truly stuck loop that
+            # this block never reaches.
+            self._diag_receive_loop_exit_ts = time.monotonic()
+            self._diag_receive_loop_exit_reason = exit_reason
+            try:
+                client_state = self._client._websocket.client_state.name
+                application_state = self._client._websocket.application_state.name
+            except Exception:
+                client_state = "unknown"
+                application_state = "unknown"
+            last_media_age = (
+                round(time.monotonic() - self._diag_last_media_in_ts, 2)
+                if self._diag_last_media_in_ts
+                else None
+            )
+            last_any_age = (
+                round(time.monotonic() - self._diag_last_any_recv_ts, 2)
+                if self._diag_last_any_recv_ts
+                else None
+            )
+            logger.warning(
+                f"{self} _receive_messages exited: "
+                f"reason={exit_reason}, "
+                f"client_state={client_state}, "
+                f"application_state={application_state}, "
+                f"is_closing={self._client.is_closing}, "
+                f"media_in_count={self._diag_media_in_count}, "
+                f"last_media_in_age_s={last_media_age}, "
+                f"last_any_recv_age_s={last_any_age}, "
+                f"non_audio_msg_count={self._diag_non_audio_msg_count}"
+            )
 
         # Trigger `on_client_disconnected` if the client actually disconnects,
         # that is, we are not the ones disconnecting.
@@ -340,6 +549,75 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
         """Wait for self._params.session_timeout seconds, if the websocket is still open, trigger timeout event."""
         await asyncio.sleep(self._params.session_timeout)
         await self._client.trigger_client_timeout()
+
+    async def _silence_watchdog(self):
+        """Soft log-only watchdog for detecting silent WebSocket death.
+
+        This task is strictly diagnostic: it NEVER cancels the receive task,
+        closes the socket, or pushes frames. Its sole job is to dump the
+        receive task's stack (plus ingress/egress state) when no WS message
+        of any kind has arrived for ``SILENCE_WATCHDOG_THRESHOLD_S`` seconds
+        AND at least one media message has been seen (so we don't fire before
+        the pipeline has even stabilised).
+
+        Gated on the ``DEAF_PIPELINE_DIAGNOSTICS`` environment variable.
+        """
+        diag_logger = logger.bind(diag_event="ws_silence_watchdog")
+        while True:
+            try:
+                await asyncio.sleep(SILENCE_WATCHDOG_INTERVAL_S)
+            except asyncio.CancelledError:
+                raise
+
+            if self._diag_media_in_count == 0:
+                # Pipeline hasn't started receiving media yet.
+                continue
+
+            now = time.monotonic()
+            last_recv = max(self._diag_last_any_recv_ts, self._diag_last_media_in_ts)
+            if last_recv == 0.0:
+                continue
+
+            silence_s = now - last_recv
+            if silence_s < SILENCE_WATCHDOG_THRESHOLD_S:
+                continue
+
+            ingress_stats = self.get_ingress_stats()
+            try:
+                egress_stats = self._client.get_egress_stats()
+            except Exception as e:
+                egress_stats = {"error": f"{e.__class__.__name__}: {e}"}
+            try:
+                audio_silence = self.get_audio_in_silence_state()
+            except Exception as e:
+                audio_silence = {"error": f"{e.__class__.__name__}: {e}"}
+
+            recv_task = self._receive_task
+            task_meta = {}
+            stack_rendered = ""
+            if recv_task is not None:
+                try:
+                    task_meta = {
+                        "name": recv_task.get_name(),
+                        "done": recv_task.done(),
+                        "cancelled": recv_task.cancelled() if recv_task.done() else False,
+                    }
+                    frames = recv_task.get_stack(limit=20)
+                    stack_rendered = "".join(traceback.format_stack(f) for f in frames)
+                except Exception as e:
+                    task_meta = {"stack_error": f"{e.__class__.__name__}: {e}"}
+
+            in_flight_age = egress_stats.get("in_flight_send_age_s") if isinstance(egress_stats, dict) else None
+
+            diag_logger.warning(
+                f"{self} ws_silence_watchdog: silence_s={silence_s:.2f}, "
+                f"receive_task={task_meta}, "
+                f"in_flight_send_age_s={in_flight_age}, "
+                f"ingress={ingress_stats}, "
+                f"egress={egress_stats}, "
+                f"audio_in_silence={audio_silence}\n"
+                f"-- receive task stack --\n{stack_rendered}"
+            )
 
 
 class FastAPIWebsocketOutputTransport(BaseOutputTransport):
