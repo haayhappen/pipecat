@@ -14,6 +14,7 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketCallbacks,
     FastAPIWebsocketClient,
     _WebSocketMessageIterator,
+    _format_task_stack,
 )
 
 
@@ -200,6 +201,70 @@ class TestSendDisconnectRace(unittest.IsolatedAsyncioTestCase):
         await client.send("text data")
 
         self.assertFalse(client.is_closing)
+
+
+class TestSilenceWatchdogStackDump(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for the deaf-pipeline silence watchdog stack-dump.
+
+    The previous implementation rendered the receive task's stack with
+    ``"".join(traceback.format_stack(f) for f in frames)``, but
+    ``traceback.format_stack`` returns a list of strings, not a single string.
+    Joining a generator of lists raises
+    ``TypeError: sequence item 0: expected str instance, list found``.
+
+    That exception was swallowed into ``task_meta['stack_error']`` which
+    meant we NEVER got to see the coroutine stack on any deaf-pipeline
+    firing. Every firing this guards is a piece of evidence we would
+    otherwise lose.
+    """
+
+    async def test_formats_suspended_task_without_typeerror(self):
+        """The exact failure mode from the deaf-pipeline triage logs."""
+        started = asyncio.Event()
+        done = asyncio.Event()
+
+        async def suspended_forever():
+            started.set()
+            await done.wait()
+
+        task = asyncio.create_task(suspended_forever(), name="suspended_forever")
+        try:
+            await started.wait()
+            # Yield once more so the task is actually parked on `done.wait()`.
+            await asyncio.sleep(0)
+
+            task_meta, stack = _format_task_stack(task)
+
+            self.assertNotIn("stack_error", task_meta)
+            self.assertEqual(task_meta.get("name"), "suspended_forever")
+            self.assertFalse(task_meta.get("done"))
+            self.assertIsInstance(stack, str)
+            self.assertTrue(len(stack) > 0)
+            self.assertNotEqual(stack, "<no frames>")
+            self.assertIn("suspended_forever", stack)
+        finally:
+            done.set()
+            await task
+
+    async def test_handles_none_task(self):
+        task_meta, stack = _format_task_stack(None)
+        self.assertEqual(task_meta, {})
+        self.assertEqual(stack, "<no task>")
+
+    async def test_handles_completed_task(self):
+        async def noop():
+            return 42
+
+        task = asyncio.create_task(noop(), name="noop")
+        await task
+
+        task_meta, stack = _format_task_stack(task)
+
+        self.assertEqual(task_meta.get("name"), "noop")
+        self.assertTrue(task_meta.get("done"))
+        self.assertIsInstance(stack, str)
+        # A completed task has no active stack; helper should degrade gracefully.
+        self.assertNotIn("stack_error", task_meta)
 
 
 if __name__ == "__main__":

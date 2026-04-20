@@ -71,6 +71,132 @@ def _deaf_diagnostics_enabled() -> bool:
     return os.getenv(_DEAF_PIPELINE_DIAGNOSTICS_ENV, "false").lower() == "true"
 
 
+def _format_task_stack(task: Optional[asyncio.Task]) -> typing.Tuple[dict, str]:
+    """Render a rich, line-safe description of an asyncio task's state.
+
+    ``asyncio.Task.get_stack()`` returns a list of ``types.FrameType`` objects.
+    For each frame, ``traceback.format_stack(f)`` returns a **list of strings**
+    (one per stack level reachable from the frame). The obvious
+    ``"".join(traceback.format_stack(f) for f in frames)`` pattern therefore
+    raises ``TypeError: sequence item 0: expected str instance, list found``
+    -- which is precisely the bug that silently neutered the deaf-pipeline
+    silence watchdog. Keep the formatting centralised here so the regression
+    never comes back.
+
+    Returns a tuple of ``(task_meta_dict, rendered_stack_str)``. Either side
+    of the tuple may carry an error key if introspection fails -- errors are
+    logged, never raised, because this runs from a diagnostic path where a
+    raise would mask the very problem we are trying to observe.
+    """
+    if task is None:
+        return {}, "<no task>"
+
+    task_meta: dict = {}
+    try:
+        task_meta = {
+            "name": task.get_name(),
+            "done": task.done(),
+            "cancelled": task.cancelled() if task.done() else False,
+        }
+    except Exception as e:
+        task_meta["meta_error"] = f"{e.__class__.__name__}: {e}"
+
+    try:
+        frames = task.get_stack(limit=20)
+    except Exception as e:
+        task_meta["stack_error"] = f"{e.__class__.__name__}: {e}"
+        return task_meta, ""
+
+    rendered_parts: list = []
+    for f in frames:
+        try:
+            rendered_parts.extend(traceback.format_stack(f))
+        except Exception as e:
+            task_meta["stack_error"] = f"{e.__class__.__name__}: {e}"
+            return task_meta, "".join(rendered_parts)
+
+    return task_meta, ("".join(rendered_parts) or "<no frames>")
+
+
+def _sample_tcp_info(websocket: "WebSocket") -> dict:
+    """Best-effort L4 snapshot of the underlying TCP socket.
+
+    This is the single most decisive signal for the "deaf pipeline" class of
+    issues: a silent WebSocket can be ESTABLISHED with no unacked bytes (peer
+    stopped sending application data), CLOSE_WAIT with any bytes (peer already
+    sent FIN we never consumed), or ESTABLISHED with a growing ``unacked``
+    (path-level packet loss).
+
+    Linux-only. Returns ``{}`` silently on any other platform, when the ASGI
+    server does not expose the raw socket (Modal's WS proxy, for example), or
+    when the struct layout we parse drifts.
+
+    The field offsets follow ``struct tcp_info`` from ``<linux/tcp.h>`` on
+    kernels >= 4.6, which is old enough that Modal's fleet should be safe.
+    """
+    import socket as _socket
+    import struct as _struct
+
+    try:
+        # Starlette wraps uvicorn's transport; try several known access paths.
+        raw_sock = None
+        scope = getattr(websocket, "scope", None) or {}
+        transport = scope.get("transport") if isinstance(scope, dict) else None
+        if transport is not None and hasattr(transport, "get_extra_info"):
+            raw_sock = transport.get_extra_info("socket")
+        if raw_sock is None:
+            # Fallback: uvicorn websockets impl exposes `transport` directly.
+            impl = getattr(websocket, "_impl", None)
+            impl_transport = getattr(impl, "transport", None) if impl is not None else None
+            if impl_transport is not None and hasattr(impl_transport, "get_extra_info"):
+                raw_sock = impl_transport.get_extra_info("socket")
+        if raw_sock is None:
+            return {"available": False, "reason": "no raw socket exposed"}
+
+        TCP_INFO = getattr(_socket, "TCP_INFO", 11)
+        buf = raw_sock.getsockopt(_socket.IPPROTO_TCP, TCP_INFO, 192)
+        if len(buf) < 64:
+            return {"available": False, "reason": f"short tcp_info ({len(buf)} bytes)"}
+
+        # Fields from struct tcp_info (Linux >= 4.6):
+        #   u8  tcpi_state           (offset 0)
+        #   u32 tcpi_unacked         (offset 20)
+        #   u32 tcpi_last_data_sent  (offset 32)
+        #   u32 tcpi_last_data_recv  (offset 36)
+        #   u32 tcpi_last_ack_recv   (offset 40)
+        #   u32 tcpi_rcv_space       (offset 60)
+        state = buf[0]
+        state_name = {
+            1: "ESTABLISHED",
+            2: "SYN_SENT",
+            3: "SYN_RECV",
+            4: "FIN_WAIT1",
+            5: "FIN_WAIT2",
+            6: "TIME_WAIT",
+            7: "CLOSE",
+            8: "CLOSE_WAIT",
+            9: "LAST_ACK",
+            10: "LISTEN",
+            11: "CLOSING",
+        }.get(state, f"UNKNOWN({state})")
+        unacked = _struct.unpack("I", buf[20:24])[0]
+        last_data_sent_ms = _struct.unpack("I", buf[32:36])[0]
+        last_data_recv_ms = _struct.unpack("I", buf[36:40])[0]
+        last_ack_recv_ms = _struct.unpack("I", buf[40:44])[0]
+        rcv_space = _struct.unpack("I", buf[60:64])[0]
+        return {
+            "available": True,
+            "tcpi_state": state_name,
+            "unacked": unacked,
+            "last_data_sent_ms": last_data_sent_ms,
+            "last_data_recv_ms": last_data_recv_ms,
+            "last_ack_recv_ms": last_ack_recv_ms,
+            "rcv_space": rcv_space,
+        }
+    except Exception as e:
+        return {"available": False, "error": f"{e.__class__.__name__}: {e}"}
+
+
 class FastAPIWebsocketParams(TransportParams):
     """Configuration parameters for FastAPI WebSocket transport.
 
@@ -503,6 +629,15 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
                     self._diag_last_non_audio_ts = time.monotonic()
                     self._diag_last_non_audio_kind = frame.__class__.__name__
                     await self.push_frame(frame)
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so without this branch it
+            # bypasses `except Exception` and falls through to `finally` with
+            # `exit_reason` still "clean" -- indistinguishable from a peer
+            # websocket.disconnect in logs. This confusion actively masked the
+            # deaf-pipeline root cause during triage (DEV-XXXX), so call it
+            # out explicitly.
+            exit_reason = "cancelled"
+            raise
         except Exception as e:
             exit_reason = f"exception:{e.__class__.__name__}:{e}"
             logger.error(f"{self} exception receiving data: {e.__class__.__name__} ({e})")
@@ -592,27 +727,22 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
             except Exception as e:
                 audio_silence = {"error": f"{e.__class__.__name__}: {e}"}
 
-            recv_task = self._receive_task
-            task_meta = {}
-            stack_rendered = ""
-            if recv_task is not None:
-                try:
-                    task_meta = {
-                        "name": recv_task.get_name(),
-                        "done": recv_task.done(),
-                        "cancelled": recv_task.cancelled() if recv_task.done() else False,
-                    }
-                    frames = recv_task.get_stack(limit=20)
-                    stack_rendered = "".join(traceback.format_stack(f) for f in frames)
-                except Exception as e:
-                    task_meta = {"stack_error": f"{e.__class__.__name__}: {e}"}
+            task_meta, stack_rendered = _format_task_stack(self._receive_task)
 
             in_flight_age = egress_stats.get("in_flight_send_age_s") if isinstance(egress_stats, dict) else None
+
+            # L4 snapshot. For the deaf-pipeline triage, this field is the
+            # decisive one: ESTABLISHED + 0 unacked + growing last_data_recv_ms
+            # means "peer stopped sending" (Twilio / application layer).
+            # CLOSE_WAIT means "peer sent FIN we never consumed" (our ASGI
+            # layer or an intermediate proxy ate it).
+            tcp_info = _sample_tcp_info(self._client._websocket)
 
             diag_logger.warning(
                 f"{self} ws_silence_watchdog: silence_s={silence_s:.2f}, "
                 f"receive_task={task_meta}, "
                 f"in_flight_send_age_s={in_flight_age}, "
+                f"tcp_info={tcp_info}, "
                 f"ingress={ingress_stats}, "
                 f"egress={egress_stats}, "
                 f"audio_in_silence={audio_silence}\n"
