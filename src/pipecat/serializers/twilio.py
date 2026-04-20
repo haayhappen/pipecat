@@ -122,6 +122,18 @@ class TwilioFrameSerializer(FrameSerializer):
         self._diag_deser_empty: int = 0
         self._diag_last_deser_ts: float = 0.0
 
+        # Deaf-pipeline triage signals. Twilio support triage asks for
+        # the last `sequenceNumber` we received so they can correlate
+        # against their own media-stream generation logs. Non-media events
+        # (stop / mark / connected / unknown) were previously silently
+        # discarded here, which meant a Twilio-issued `stop` at the freeze
+        # boundary would leave no trace. See deaf_pipeline_investigation-*.
+        self._diag_last_sequence_number: Optional[int] = None
+        self._diag_last_sequence_ts: float = 0.0
+        self._diag_last_non_media_event: Optional[str] = None
+        self._diag_last_non_media_event_ts: float = 0.0
+        self._diag_non_media_event_count: int = 0
+
     async def setup(self, frame: StartFrame):
         """Sets up the serializer with pipeline configuration.
 
@@ -239,11 +251,20 @@ class TwilioFrameSerializer(FrameSerializer):
 
     def get_deserialize_stats(self) -> dict:
         """Return deserialization counters for diagnostics."""
+        now = time.monotonic()
         return {
             "deser_count": self._diag_deser_count,
             "deser_bytes": self._diag_deser_bytes,
             "deser_empty": self._diag_deser_empty,
-            "last_deser_age_s": round(time.monotonic() - self._diag_last_deser_ts, 3) if self._diag_last_deser_ts else None,
+            "last_deser_age_s": round(now - self._diag_last_deser_ts, 3) if self._diag_last_deser_ts else None,
+            # Twilio-specific triage fields. `last_sequence_number` is the
+            # correlation key Twilio support asks for when they look at a
+            # media-stream freeze on their side.
+            "last_sequence_number": self._diag_last_sequence_number,
+            "last_sequence_age_s": round(now - self._diag_last_sequence_ts, 3) if self._diag_last_sequence_ts else None,
+            "last_non_media_event": self._diag_last_non_media_event,
+            "last_non_media_event_age_s": round(now - self._diag_last_non_media_event_ts, 3) if self._diag_last_non_media_event_ts else None,
+            "non_media_event_count": self._diag_non_media_event_count,
         }
 
     async def deserialize(self, data: str | bytes) -> Frame | None:
@@ -258,8 +279,22 @@ class TwilioFrameSerializer(FrameSerializer):
             A Pipecat frame corresponding to the Twilio event, or None if unhandled.
         """
         message = json.loads(data)
+        event = message.get("event")
 
-        if message["event"] == "media":
+        # Twilio's Media Streams protocol tags every event with a monotonically
+        # increasing `sequenceNumber`. Stamping the most recent one here lets
+        # deaf-pipeline triage tell Twilio support "we received up to N, then
+        # nothing" -- the single field their ops team needs to correlate
+        # against their own media generation logs.
+        raw_seq = message.get("sequenceNumber")
+        if raw_seq is not None:
+            try:
+                self._diag_last_sequence_number = int(raw_seq)
+            except (TypeError, ValueError):
+                self._diag_last_sequence_number = raw_seq  # type: ignore[assignment]
+            self._diag_last_sequence_ts = time.monotonic()
+
+        if event == "media":
             payload_base64 = message["media"]["payload"]
             payload = base64.b64decode(payload_base64)
 
@@ -278,12 +313,36 @@ class TwilioFrameSerializer(FrameSerializer):
                 audio=deserialized_data, num_channels=1, sample_rate=self._sample_rate
             )
             return audio_frame
-        elif message["event"] == "dtmf":
+        elif event == "dtmf":
             digit = message.get("dtmf", {}).get("digit")
 
             try:
                 return InputDTMFFrame(KeypadEntry(digit))
-            except ValueError as e:
+            except ValueError:
                 return None
-        else:
-            return None
+
+        # Any non-media, non-dtmf event. These are low-volume (Twilio sends
+        # them once per state transition: `connected`, `start`, `stop`,
+        # plus `mark` echoes) so it is safe to log every single one. If
+        # Twilio issues a `stop` at the deaf-pipeline freeze boundary, this
+        # log line is how we find out -- previously these were silently
+        # discarded.
+        self._diag_non_media_event_count += 1
+        self._diag_last_non_media_event = event
+        self._diag_last_non_media_event_ts = time.monotonic()
+        logger.info(
+            "twilio_event event={} streamSid={} callSid={} sequenceNumber={} payload={}",
+            event,
+            message.get("streamSid"),
+            # stop events include a `callSid` alongside `streamSid`; log both.
+            (message.get("stop") or {}).get("callSid") if isinstance(message.get("stop"), dict) else None,
+            raw_seq,
+            # Twilio payload varies by event type; keep the handful of fields
+            # that actually matter for triage.
+            {
+                k: message.get(k)
+                for k in ("start", "stop", "mark", "dtmf")
+                if message.get(k) is not None
+            },
+        )
+        return None
